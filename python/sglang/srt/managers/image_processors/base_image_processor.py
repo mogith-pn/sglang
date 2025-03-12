@@ -48,7 +48,7 @@ class BaseImageProcessor(ABC):
         self.NUM_TOKEN_PER_FRAME = 330
 
         logger.info("No of CPUs access to base image processor : OS CPU Count :",os.cpu_count())
-        logger.info("No of CPUs access to base image processor : ENV CPU:",os.environ.get("SGLANG_CPU_COUNT",'dummy_val')
+        logger.info("No of CPUs access to base image processor : ENV CPU:",os.environ.get("SGLANG_CPU_COUNT",'dummy_val'))
 
         self.executor = concurrent.futures.ProcessPoolExecutor(
             initializer=init_global_processor,
