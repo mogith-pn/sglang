@@ -47,6 +47,9 @@ class BaseImageProcessor(ABC):
         # FIXME: not accurate, model and image specific
         self.NUM_TOKEN_PER_FRAME = 330
 
+        print("No of CPUs access to base image processor : OS CPU Count :",os.cpu_count())
+        print("No of CPUs access to base image processor : ENV CPU:",os.environ.get("SGLANG_CPU_COUNT",'dummy_val'))
+
         self.executor = concurrent.futures.ProcessPoolExecutor(
             initializer=init_global_processor,
             mp_context=mp.get_context("fork"),
