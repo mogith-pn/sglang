@@ -918,9 +918,13 @@ OpenAIServingRequest = Union[
 class ResponseReasoningParam(BaseModel):
     """Reasoning parameters for responses."""
 
-    effort: Optional[Literal["low", "medium", "high"]] = Field(
+    effort: Optional[Literal["low", "medium", "high", "none"]] = Field(
         default="medium",
-        description="Constrains effort on reasoning for reasoning models.",
+        description=(
+            "Constrains effort on reasoning for reasoning models. "
+            "Use 'none' to disable reasoning-specific handling and route to plain completions "
+            "for GPT-OSS models on this server."
+        ),
     )
 
 

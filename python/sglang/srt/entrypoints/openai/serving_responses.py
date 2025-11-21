@@ -47,6 +47,9 @@ from sglang.srt.entrypoints.harmony_utils import (
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
+    CompletionRequest,
+    CompletionResponse,
+    ErrorResponse,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
     ResponsesRequest,
@@ -54,6 +57,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     UsageInfo,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -124,6 +128,121 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         self.background_tasks: dict[str, asyncio.Task] = {}
 
+        # Completion handler for optional routing when reasoning.effort == "none"
+        self._completion_handler = OpenAIServingCompletion(
+            tokenizer_manager, template_manager
+        )
+
+    async def _handle_via_completions(
+        self,
+        request: ResponsesRequest,
+        raw_request: Optional[Request],
+    ) -> Union[ResponsesResponse, ORJSONResponse]:
+        """Handle a /v1/responses request via the plain Completions implementation.
+
+        This is used when the caller explicitly sets reasoning.effort == \"none\"
+        for a GPT-OSS model. It builds a CompletionRequest, calls the existing
+        /v1/completions serving stack, then converts the CompletionResponse back
+        into a ResponsesResponse.
+        """
+        logger.info(
+            "OpenAIServingResponses: routing via completions | request_id=%s model=%s reasoning_effort=%r",
+            request.request_id,
+            request.model,
+            getattr(request.reasoning, "effort", None) if request.reasoning else None,
+        )
+        # Currently we only support simple string input for this path.
+        if not isinstance(request.input, str):
+            return self.create_error_response(
+                "Completion-based reasoning='none' path currently requires 'input' to be a plain string.",
+                err_type="invalid_request_error",
+                param="input",
+            )
+
+        # Build a completion-style prompt from instructions + input.
+        if request.instructions:
+            prompt = f"{request.instructions}\n\n{request.input}"
+        else:
+            prompt = request.input
+
+        # Map ResponsesRequest fields onto CompletionRequest.
+        max_tokens = request.max_output_tokens or 512
+        completion_req = CompletionRequest(
+            model=request.model or self.tokenizer_manager.model_config.model_path,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=request.temperature if request.temperature is not None else 1.0,
+            top_p=request.top_p if request.top_p is not None else 1.0,
+            frequency_penalty=request.frequency_penalty,
+            presence_penalty=request.presence_penalty,
+            stop=request.stop,
+            top_k=request.top_k,
+            min_p=request.min_p,
+            repetition_penalty=request.repetition_penalty,
+            stream=False,
+            user=request.user,
+            rid=request.request_id,
+            extra_key=request.extra_key,
+            cache_salt=request.cache_salt,
+            priority=request.priority,
+        )
+
+        # Convert to internal GenerateReqInput and run through completion handler.
+        adapted_request, completion_req = self._completion_handler._convert_to_internal_request(  # type: ignore[attr-defined]
+            completion_req, raw_request  # type: ignore[arg-type]
+        )
+
+        result = await self._completion_handler._handle_non_streaming_request(  # type: ignore[attr-defined]
+            adapted_request, completion_req, raw_request  # type: ignore[arg-type]
+        )
+
+        # Propagate HTTP-style errors as-is.
+        if isinstance(result, ORJSONResponse):
+            return result
+
+        assert isinstance(result, CompletionResponse)
+
+        # Use the first choice as the main output text.
+        if not result.choices:
+            return self.create_error_response("Empty completion result from completions path")
+
+        completion_text = result.choices[0].text
+
+        # Build output items in Responses format.
+        output_items = self._make_response_output_items(
+            request,
+            completion_text,
+            self.tokenizer_manager.tokenizer,
+        )
+
+        # Derive sampling params so ResponsesResponse can carry them; we construct
+        # default_max_tokens so that max_new_tokens ~= completion_req.max_tokens.
+        default_max_tokens = max_tokens + 2
+        sampling_params = request.to_sampling_params(
+            default_max_tokens, self.default_sampling_params
+        )
+
+        # Map usage information.
+        comp_usage = result.usage
+        usage = UsageInfo(
+            prompt_tokens=comp_usage.prompt_tokens,
+            completion_tokens=comp_usage.completion_tokens,
+            total_tokens=comp_usage.total_tokens,
+            reasoning_tokens=0,
+        )
+
+        responses_resp = ResponsesResponse.from_request(
+            request,
+            sampling_params,
+            model_name=result.model,
+            created_time=result.created,
+            output=output_items,
+            status="completed",
+            usage=usage,
+        )
+
+        return responses_resp
+
     # error helpers dedicated for v1/responses
     def create_error_response(
         self,
@@ -171,6 +290,35 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         # FIXME: If the engine is dead, raise an error
         # This is required for the streaming case
+
+        # Optional: route certain GPT-OSS responses requests through the plain
+        # Completions implementation instead of Harmony.
+        #
+        # When the caller explicitly sets reasoning.effort == "none" we treat that
+        # as "no special reasoning / Harmony behavior" and delegate to the
+        # /v1/completions implementation, then wrap the result back into a
+        # ResponsesResponse. This is currently supported only for:
+        #   - non-streaming requests
+        #   - no background execution
+        #   - no tools
+        #   - no previous_response_id (new turn only)
+        if (
+            self.use_harmony
+            and request.reasoning is not None
+            and getattr(request.reasoning, "effort", None) == "none"
+            and not request.stream
+            and not request.background
+            and not request.tools
+            and request.previous_response_id is None
+        ):
+            return await self._handle_via_completions(request, raw_request)
+
+        logger.info(
+            "OpenAIServingResponses: using standard responses path | request_id=%s model=%s use_harmony=%s",
+            request.request_id,
+            request.model,
+            self.use_harmony,
+        )
 
         # Handle the previous response ID
         prev_response_id = request.previous_response_id
@@ -449,10 +597,12 @@ class OpenAIServingResponses(OpenAIServingChat):
         if self.use_harmony:
             assert isinstance(context, HarmonyContext)
             output = self._make_response_output_items_with_harmony(context)
-            # TODO: these are all 0 for now!
-            num_prompt_tokens = context.num_prompt_tokens
-            num_generated_tokens = context.num_output_tokens
+            # For Harmony / GPT-OSS, count both freshly-encoded and cached prompt tokens
+            # as "prompt_tokens" to better match OpenAI-style accounting.
+            base_prompt_tokens = context.num_prompt_tokens
             num_cached_tokens = context.num_cached_tokens
+            num_prompt_tokens = base_prompt_tokens + num_cached_tokens
+            num_generated_tokens = context.num_output_tokens
             num_reasoning_tokens = context.num_reasoning_tokens
         else:
             assert isinstance(context, SimpleContext)
@@ -465,22 +615,25 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             # Calculate usage from actual output
             if hasattr(final_res, "meta_info"):
-                num_prompt_tokens = final_res.meta_info.get("prompt_tokens", 0)
-                num_generated_tokens = final_res.meta_info.get("completion_tokens", 0)
+                base_prompt_tokens = final_res.meta_info.get("prompt_tokens", 0)
                 num_cached_tokens = final_res.meta_info.get("cached_tokens", 0)
+                num_prompt_tokens = base_prompt_tokens + num_cached_tokens
+                num_generated_tokens = final_res.meta_info.get("completion_tokens", 0)
+                num_reasoning_tokens = 0
             elif hasattr(final_res, "prompt_token_ids") and hasattr(
                 final_res, "outputs"
             ):
                 # Fallback calculation if meta_info not available
-                num_prompt_tokens = (
+                base_prompt_tokens = (
                     len(final_res.prompt_token_ids) if final_res.prompt_token_ids else 0
                 )
+                num_cached_tokens = getattr(final_res, "num_cached_tokens", 0)
+                num_prompt_tokens = base_prompt_tokens + num_cached_tokens
                 num_generated_tokens = (
                     len(final_res.outputs[0].token_ids)
                     if final_res.outputs and final_res.outputs[0].token_ids
                     else 0
                 )
-                num_cached_tokens = getattr(final_res, "num_cached_tokens", 0)
                 num_reasoning_tokens = 0
             else:
                 # Final fallback
