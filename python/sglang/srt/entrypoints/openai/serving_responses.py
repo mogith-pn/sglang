@@ -597,10 +597,12 @@ class OpenAIServingResponses(OpenAIServingChat):
         if self.use_harmony:
             assert isinstance(context, HarmonyContext)
             output = self._make_response_output_items_with_harmony(context)
-            # TODO: these are all 0 for now!
-            num_prompt_tokens = context.num_prompt_tokens
-            num_generated_tokens = context.num_output_tokens
+            # For Harmony / GPT-OSS, count both freshly-encoded and cached prompt tokens
+            # as "prompt_tokens" to better match OpenAI-style accounting.
+            base_prompt_tokens = context.num_prompt_tokens
             num_cached_tokens = context.num_cached_tokens
+            num_prompt_tokens = base_prompt_tokens + num_cached_tokens
+            num_generated_tokens = context.num_output_tokens
             num_reasoning_tokens = context.num_reasoning_tokens
         else:
             assert isinstance(context, SimpleContext)
@@ -613,22 +615,25 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             # Calculate usage from actual output
             if hasattr(final_res, "meta_info"):
-                num_prompt_tokens = final_res.meta_info.get("prompt_tokens", 0)
-                num_generated_tokens = final_res.meta_info.get("completion_tokens", 0)
+                base_prompt_tokens = final_res.meta_info.get("prompt_tokens", 0)
                 num_cached_tokens = final_res.meta_info.get("cached_tokens", 0)
+                num_prompt_tokens = base_prompt_tokens + num_cached_tokens
+                num_generated_tokens = final_res.meta_info.get("completion_tokens", 0)
+                num_reasoning_tokens = 0
             elif hasattr(final_res, "prompt_token_ids") and hasattr(
                 final_res, "outputs"
             ):
                 # Fallback calculation if meta_info not available
-                num_prompt_tokens = (
+                base_prompt_tokens = (
                     len(final_res.prompt_token_ids) if final_res.prompt_token_ids else 0
                 )
+                num_cached_tokens = getattr(final_res, "num_cached_tokens", 0)
+                num_prompt_tokens = base_prompt_tokens + num_cached_tokens
                 num_generated_tokens = (
                     len(final_res.outputs[0].token_ids)
                     if final_res.outputs and final_res.outputs[0].token_ids
                     else 0
                 )
-                num_cached_tokens = getattr(final_res, "num_cached_tokens", 0)
                 num_reasoning_tokens = 0
             else:
                 # Final fallback
